@@ -1,0 +1,12 @@
+{
+ "ORACLE_HOME" : "/oraclebase/product/11.1_client",
+ "PATH"        : "/usr2/rwcds/ce/v1/common/bin",
+ "rdbpath"     : "/usr2/rwcds/ce/v1/common/rating_tables",
+ "dbuser"      : "USERNAME",
+ "dbpassword"  : "PASSWORD",
+ "dbname"      : "detect",
+ "office"      : "OFFICE",
+ "timeFormat"  : "%d-%b-%Y %H%M",
+ "timeZone"    : "GMT"
+ 
+}

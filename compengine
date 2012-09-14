@@ -1,0 +1,588 @@
+#!/usr/local/bin/python
+#Computation Engine v1.3
+#15 September 2012
+#Author: Gunnar Leffler
+
+import sys,os,json
+import time,datetime
+import celib, atexit
+
+#Read Configuration File
+myloc = sys.argv[0].replace("compengine","") #determine where executable lives
+conf = json.loads(open(myloc+"compengine.json","r").read())
+#Add relevent entriys to environment variables
+os.putenv("ORACLE_HOME",conf["ORACLE_HOME"])
+sys.path.append(conf["PATH"])
+
+#Internal Variables
+variables = {}
+commands = {}
+tokens = [] #statement argument stack
+
+#------------------------------------------------------------------------------
+#INTERNALS
+#This is where the internal variable definitions and methods go
+#internal variable definitions are stored in a dictionary
+#------------------------------------------------------------------------------
+internals = {}
+
+internals["lookback"] = datetime.timedelta(days=1)
+internals["lookforward"] = datetime.timedelta(days=0)
+internals["now"] = datetime.datetime.utcnow()
+internals["starttime"] = internals["now"]-internals["lookback"]
+internals["endtime"] = internals["now"]+internals["lookforward"]
+internals["line"] = ""
+internals["linecounter"] = 0
+internals["rdbpath"] = "/usr2/rwcds/ce/v1/common/rating_tables"
+internals["units"] = "default"
+#internal variables that are protected from being directly written to by users
+internals["protected"] = ["starttime","endtime","now","protected","line","linecounter"] 
+
+#This method writes to standard error
+#logging functionality can be added here
+def complain (s):
+  sys.stderr.write("Error on line "+str(internals["linecounter"])+"\n")
+  sys.stderr.write(internals["line"]+"\n")
+  sys.stderr.write(s+"\n")
+
+#This takes an input line and tokenizes it
+def tokenizeInput (_input):
+  internals["linecounter"] += 1
+  internals["line"] = _input
+  input = ""
+  #Strip comments
+  for c in _input.strip():
+    if c != "#":
+      input += c
+    else:
+      break
+  tokens = input.split(" ")
+  output = []
+  for t in tokens:
+    if t != "":
+      output.append(t)
+  return output
+
+#This takes a relative time and turns it into a timedelta
+#eg input 7d6h9m
+def parseTimedelta (input):
+  input = input.lower()
+  output = datetime.timedelta(seconds = 0)
+  t = ""
+  try:
+    for c in input:
+      if c =="d":
+        output += datetime.timedelta(days=float(t))
+        t = ""
+      elif c =="h":
+        output += datetime.timedelta(hours=float(t))
+        t = ""
+      elif c =="m":
+        output += datetime.timedelta(minutes=float(t))
+        t = ""
+      else:
+        t += c
+  except:
+    complain("Could not parse"+input+" into a time interval")
+  return output
+
+def getTimeSeries(timeseries):
+  if timeseries in variables:
+    return variables[timeseries]
+  else:
+    ts = celib.timeSeries(ds.readTS(timeseries,internals["starttime"],internals["endtime"],internals["units"]))
+    if ts == None:
+      ts = celib.timeSeries()
+      complain (timeseries+" does not exist")
+    if ds.status != "OK":
+      complain (ds.status)
+      ds.status = "OK"
+      ts = celib.timeSeries()
+    return ts
+
+def is_number(s):
+  try:
+    float(s)
+    return True
+  except ValueError:
+    return False
+
+
+#---------------------------------------------
+#Commands
+#---------------------------------------------
+commands = {}
+def printIt():
+  if len (tokens) > 0:
+    print evalStatement()
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+#converts the remaining tokens on a line to a string for logging/printing
+def toString():
+  output = ""
+  while len(tokens) > 0:
+    output += tokens.pop(0)+" "
+  return output
+
+#exits the interpreter
+def bye():
+  sys.exit(0)
+
+def defineVariable ():
+  global tokens
+  if len (tokens) > 0:
+    name = tokens.pop(0)
+    variables[name] = evalStatement()
+    return variables[name]
+  else:
+    complain ("Not enough arguments.")
+
+def setInternal ():
+  global tokens
+  if len (tokens) > 1:
+    name = tokens.pop(0)
+    val = tokens.pop(0)
+    if (not name in internals) or (name in internals["protected"]):
+      complain("Invaild Internal Reference")
+    if name == "lookback" or name == "lookforward":
+      internals[name] = parseTimedelta(val)
+      internals["starttime"] = internals["now"]-internals["lookback"]
+      internals["endtime"] = internals["now"]+internals["lookforward"]
+    else:
+      internals[name] = val
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+#Match time offset
+def matchoffset ():
+  global tokens
+  if len (tokens) > 0:
+    ts = evalStatement()
+    if ts != None:
+      internals["lookback"]= internals["now"]-ts.data[0][0]
+      internals["starttime"] = internals["now"]-internals["lookback"]
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def interpolate ():
+  global tokens
+  if len (tokens) > 1:
+    interval = parseTimedelta(tokens.pop(0))
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.interpolate(interval)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def timeshift ():
+  global tokens
+  if len (tokens) > 1:
+    interval = parseTimedelta(tokens.pop(0))
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.timeshift(interval)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def average ():
+  global tokens
+  if len (tokens) > 1:
+    interval = parseTimedelta(tokens.pop(0))
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.average(interval)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def rollingaverage ():
+  global tokens
+  if len (tokens) > 1:
+    interval = parseTimedelta(tokens.pop(0))
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.rollingaverage(interval)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def percent ():
+  global tokens
+  if len (tokens) > 1:
+    numerator = evalStatement()
+    denominator = evalStatement()
+    output = numerator.percent(denominator)
+    if numerator.status == "OK":
+      return output
+    else:
+      complain (numerator.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def store ():
+  global tokens
+  if len (tokens) > 1:
+    source = evalStatement()
+    tsid = tokens.pop(0)
+    if source.status == "OK":
+      ds.writeToCWMS (tsid,internals["units"],source.data)
+      if ds.status == "OK":
+        return source
+      else:
+        complain (ds.getStatus())
+    else:
+      complain (source.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def snap ():
+  global tokens
+  if len (tokens) > 2:
+    interval = parseTimedelta(tokens.pop(0))
+    buffer = parseTimedelta(tokens.pop(0))
+    if buffer > interval/2:
+      complain ("WARNING: buffer is greater than interval/2")
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.snap(interval,buffer)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def maximum ():
+  global tokens
+  if len (tokens) > 1:
+    interval = parseTimedelta(tokens.pop(0))
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.maxmin(interval,lambda x,y:x>y)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def minimum ():
+  global tokens
+  if len (tokens) > 1:
+    interval = parseTimedelta(tokens.pop(0))
+    if interval == None:
+      complain ("No or invalid interval specified")
+      return None
+    ts = evalStatement()
+    output = ts.maxmin(interval,lambda x,y:x<y)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def rate ():
+  global tokens
+  if len (tokens) > 1:
+    path = tokens.pop(0)
+    myrdb = celib.rdb(internals["rdbpath"]+"/"+path)
+    if myrdb.status != "OK":
+      complain ("Problem Occured with RDB file"+myrdb.status)
+      return None
+    ts = evalStatement()
+    output = myrdb.rateTS(ts)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def rate2 ():
+  global tokens
+  if len (tokens) > 1:
+    path = tokens.pop(0)
+    myrdb = celib.rdb(internals["rdbpath"]+"/"+path)
+    if myrdb.status != "OK":
+      complain ("Problem Occured with RDB file"+myrdb.status)
+      return None
+    ts = evalStatement()
+    output = myrdb.rateTS2(ts)
+    if ts.status == "OK":
+      return output
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def tablelookup ():
+  global tokens
+  if len (tokens) > 2:
+    path = tokens.pop(0)
+    mytable = celib.tablegrid(internals["rdbpath"]+"/"+path)
+    if mytable.status != "OK":
+      complain ("Problem Occured with table file"+mytable.status)
+      return None
+    cols = evalStatement()
+    rows = evalStatement()
+    if cols.status != "OK":
+      complain (cols.getStatus())
+    elif rows.status != "OK":
+      complain (rows.getStatus())
+    else:
+      return mytable.rateTS(cols,rows)
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def inflow ():
+  global tokens
+  if len (tokens) > 1:
+    storage = evalStatement()
+    outflow = evalStatement()
+    if storage == None or outflow == None:
+      complain ("Problem Occured with input")
+      return None
+    output = []
+    for i in xrange (len(storage.data)-1):
+      flow = outflow.findValue(storage.data[i][0])
+      if flow != None:
+        deltat = (storage.data[i+1][0] - storage.data[i][0]).total_seconds()
+        deltaS = storage.data[i+1][1] - storage.data[i][1]
+        out = (deltaS*43560)/deltat + flow
+        output.append([storage.data[i][0],out,storage.data[i][2]])
+    return celib.timeSeries(output)
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def addition ():
+  global tokens
+  if len (tokens) > 1:
+    if is_number(tokens[0]):
+      operand1 = float(tokens.pop(0))
+    else:
+      operand1 = evalStatement()
+    if is_number(tokens[0]):
+      operand2 = float(tokens.pop(0))
+    else:
+      operand2 = evalStatement()
+    if type(operand1) is float and type(operand2) is float:
+      complain ("At least one operand must be a timeseries")
+      return None
+    elif type(operand2) is float:
+      output = operand1.operation(lambda x,y: x+y,operand2)
+    else:
+      output = operand2.operation(lambda x,y: x+y,operand1)
+    return output
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def multiply ():
+  global tokens
+  if len (tokens) > 1:
+    if is_number(tokens[0]):
+      operand1 = float(tokens.pop(0))
+    else:
+      operand1 = evalStatement()
+    if is_number(tokens[0]):
+      operand2 = float(tokens.pop(0))
+    else:
+      operand2 = evalStatement()
+    if type(operand1) is float and type(operand2) is float:
+      complain ("At least one operand must be a timeseries")
+      return None
+    elif type(operand2) is float:
+      output = operand1.operation(lambda x,y: x*y,operand2)
+    else:
+      output = operand2.operation(lambda x,y: x*y,operand1)
+    return output
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+def subtraction ():
+  global tokens
+  if len (tokens) > 1:
+    if is_number(tokens[0]):
+      operand1 = float(tokens.pop(0))
+    else:
+      operand1 = evalStatement()
+    if is_number(tokens[0]):
+      operand2 = float(tokens.pop(0))
+    else:
+      operand2 = evalStatement()
+    if type(operand1) is float and type(operand2) is float:
+      complain ("At least one operand must be a timeseries")
+      return None
+    elif type(operand2) is float:
+      output = operand1.operation(lambda x,y: x-y,operand2)
+    else:
+      output = operand2.operation(lambda x,y: y-x,operand1)
+    return output
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def division ():
+  global tokens
+  if len (tokens) > 1:
+    if is_number(tokens[0]):
+      operand1 = float(tokens.pop(0))
+    else:
+      operand1 = evalStatement()
+    if is_number(tokens[0]):
+      operand2 = float(tokens.pop(0))
+    else:
+      operand2 = evalStatement()
+    if type(operand1) is float and type(operand2) is float:
+      complain ("At least one operand must be a timeseries")
+      return None
+    elif type(operand2) is float:
+      output = operand1.operation(lambda x,y: x/y,operand2)
+    else:
+      output = operand2.operation(lambda x,y: y/x,operand1)
+    return output
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+def export ():
+  global tokens
+  if len (tokens) > 1:
+    filename = tokens.pop(0)
+    ts = evalStatement()
+    if ts.status == "OK":
+      try:
+        open(filename,"w").write(str(ts))
+      except:
+        complain("Cannot Write File: "+filenamechmo)
+    else:
+      complain (ts.getStatus())
+  else:
+    complain ("Not enough arguments.")
+  return None
+
+
+commands["add"] = addition
+commands["average"] = average
+commands["bicurve"] = tablelookup
+commands["bye"] = bye
+commands["def"] = defineVariable
+commands["exit"] = bye 
+commands["inflow"] = inflow
+commands["interpolate"] = interpolate
+commands["matchoffset"] = matchoffset
+commands["max"] = maximum
+commands["min"] = minimum
+commands["percent"] = percent
+commands["print"] = printIt
+commands["rate"] = rate
+commands["rate2"] = rate2
+commands["rollingaverage"] = rollingaverage
+commands["set"] = setInternal
+commands["snap"] = snap
+commands["store"] = store
+commands["string"] = toString 
+commands["subtract"] = subtraction
+commands["sub"] = subtraction
+commands["multiply"] = multiply
+commands["mul"] = multiply
+commands["divide"] = division
+commands["div"] = division
+commands["timeshift"] = timeshift
+commands["tablelookup"] = tablelookup
+commands["export"] = export
+
+#---------------------------------------------
+#console
+#---------------------------------------------
+
+def readConfiguration():
+  global conf
+
+def evalStatement():
+  global tokens
+  token = tokens.pop(0)
+  if token in commands:
+    return commands[token]()
+  elif token in variables:
+    return variables[token]
+  elif token in internals:
+    return internals[token]
+  else:
+    return getTimeSeries (token)
+  
+def doConsole():
+  global tokens
+  print "Computation Engine v1.3"
+  done = False
+  while done == False:
+    s = raw_input(">") 
+    tokens = tokenizeInput(s)
+    if len (tokens) > 0:
+      evalStatement()
+
+
+#---------------------------------------------
+#The heart of the matter
+#---------------------------------------------
+
+ds = celib.dataService()
+ds.updateConfiguration(conf)
+ds.connect()
+if ds.status != "OK":
+  raise Exception(ds.status)
+atexit.register(ds.disconnect)
+doConsole()
+
